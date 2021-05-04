@@ -1,44 +1,96 @@
+@Library('jenkins-shared-library@master') _
+pipeline {
 
-node {
+  agent any
   
-  def image
-  def mvnHome = tool 'Maven3'
-
-  
-     stage ('checkout') {
-        checkout([$class: 'GitSCM', branches: [[name: '*/master']], doGenerateSubmoduleConfigurations: false, extensions: [], submoduleCfg: [], userRemoteConfigs: [[credentialsId: '9ffd4ee4-3647-4a7d-a357-5e8746463282', url: 'https://bitbucket.org/ananthkannan/myawesomeangularapprepo/']]])       
-        }
-    
-    
-    stage ('Build') {
-            sh 'mvn -f MyAwesomeApp/pom.xml clean install'            
-        }
-        
-    stage ('archive') {
-            archiveArtifacts '**/*.jar'
-        }
-        
-    stage ('Docker Build') {
-         // Build and push image with Jenkins' docker-plugin
-        withDockerServer([uri: "tcp://localhost:4243"]) {
-
-            withDockerRegistry([credentialsId: "fa32f95a-2d3e-4c7b-8f34-11bcc0191d70", url: "https://index.docker.io/v1/"]) {
-            image = docker.build("ananthkannan/mywebapp", "MyAwesomeApp")
-            image.push()
-            
+  parameters {
+	choice(name: 'action', choices: 'create\nrollback', description: 'Create/rollback of the deployment')
+    string(name: 'ImageName', description: "Name of the docker build")
+	string(name: 'ImageTag', description: "Name of the docker build")
+	string(name: 'AppName', description: "Name of the Application")
+    string(name: 'docker_repo', description: "Name of docker repository")
+  }
+      
+  tools{ 
+        maven 'maven3'
+    }
+    stages {
+        stage('Git Checkout') {
+            when {
+				expression { params.action == 'create' }
+			}
+            steps {
+                gitCheckout(
+                    branch: "main",
+                    url: "https://github.com/sekharhexa/MyAwesomeAngularAppRepo.git"
+                )
             }
         }
-    }
-    
-       stage('docker stop container') {
-            sh 'docker ps -f name=myContainer -q | xargs --no-run-if-empty docker container stop'
-            sh 'docker container ls -a -fname=myContainer -q | xargs -r docker container rm'
-
-       }
-
-    stage ('Docker run') {
-
-        image.run("-p 8085:8085 --rm --name myContainer")
-
-    }
+        stage('Build Maven'){
+            when {
+				expression { params.action == 'create' }
+			}
+    		steps {
+        		dir("${params.AppName}") {
+        			sh 'mvn -f pom.xml clean install'
+        		}
+    		}
+	    }
+	   stage("Docker Build and Push") {
+	        when {
+				expression { params.action == 'create' }
+			}
+	        steps {
+	            dir("${params.AppName}") {
+	                dockerBuild ( "${params.ImageName}", "${params.docker_repo}" )
+	            }
+	        }
+	    }
+	    stage("Docker CleanUP") {
+	        when {
+				expression { params.action == 'create' }
+			}
+	        steps {
+	            dockerCleanup ( "${params.ImageName}", "${params.docker_repo}" )
+			}
+		}
+	    stage("Create deployment") {
+			when {
+				expression { params.action == 'create' }
+			}
+	        steps {
+	            dir("${params.AppName}") {
+	                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', 
+	                        accessKeyVariable: 'AWS_ACCESS_KEY_ID', 
+	                        credentialsId: 'AWS_Credentials', 
+	                        secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+	                    withCredentials([kubeconfigFile(credentialsId: 'kubernetes_config', 
+	                        variable: 'KUBECONFIG')]) {
+	                        sh 'export KUBECONFIG=$HOME/.kube/config'
+	                        sh 'kubectl create -f deploy-loadbalancer.yml'
+	                    }
+	                }
+	            }
+	        }
+	    }
+		stage("rollback deployment") {
+			when {
+				expression { params.action == 'rollback' }
+			}
+	        steps {
+	           withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', 
+	                        accessKeyVariable: 'AWS_ACCESS_KEY_ID', 
+	                        credentialsId: 'AWS_Credentials', 
+	                        secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+	               withCredentials([kubeconfigFile(credentialsId: 'kubernetes_config', 
+	                        variable: 'KUBECONFIG')]) {
+	               sh """
+	                    kubectl delete deploy ${params.AppName}
+					    kubectl delete svc ${params.AppName}
+				   """
+	               }
+	            }
+	        }
+	    }
+	}
 }
